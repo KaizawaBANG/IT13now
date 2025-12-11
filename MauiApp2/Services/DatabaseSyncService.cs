@@ -32,8 +32,11 @@ namespace MauiApp2.Services
             // Supplier & Customer
             "tbl_supplier",
             "tbl_customer",
+<<<<<<< HEAD
             
             // Purchase Operations
+=======
+>>>>>>> 4ac6898 (add pdf styles)
             "tbl_purchase_order",
             "tbl_purchase_order_items",
             "tbl_stock_in",
@@ -44,8 +47,11 @@ namespace MauiApp2.Services
             "tbl_sales_order_items",
             "tbl_stock_out",
             "tbl_stock_out_items",
+<<<<<<< HEAD
             
             // Accounting
+=======
+>>>>>>> 4ac6898 (add pdf styles)
             "tbl_chart_of_accounts",
             "tbl_accounts_payable",
             "tbl_payments",
