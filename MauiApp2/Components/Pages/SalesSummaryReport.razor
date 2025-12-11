@@ -67,7 +67,7 @@ else
                     <div class="filter-group">
                         <label>Group By</label>
                         <div class="select-wrapper">
-                            <select class="form-control" @bind="groupBy" @bind:event="onchange">
+                            <select class="form-control" @bind="groupBy" @bind:event="onchange" @bind:after="OnGroupByChanged">
                                 <option value="Day">Day</option>
                                 <option value="Week">Week</option>
                                 <option value="Month">Month</option>
@@ -374,6 +374,13 @@ else
             var startDateStr = startDate.ToString("dd.MM.yyyy");
             var endDateStr = endDate.ToString("dd.MM.yyyy");
             
+            // Calculate summary metrics
+            var totalTransactions = TotalTransactions;
+            var totalRevenue = TotalRevenue;
+            var totalTax = TotalTax;
+            var totalSubtotal = FilteredReportData.Sum(r => r.Subtotal);
+            var averageTransaction = AverageTransaction;
+            
             await JSRuntime.InvokeVoidAsync("pdfExport.exportSalesSummaryToPdf", 
                 "report-table",
                 reportNumber,
@@ -381,6 +388,11 @@ else
                 startDateStr,
                 endDateStr,
                 groupBy,
+                totalTransactions,
+                totalRevenue,
+                totalTax,
+                totalSubtotal,
+                averageTransaction,
                 $"SalesSummary_Report_{DateTime.Now:yyyyMMdd_HHmmss}.pdf");
         }
         catch (Exception ex)
@@ -396,27 +408,58 @@ else
         errorMessage = "";
     }
 
-    private void OnStartDateChanged(ChangeEventArgs e)
+    private async Task OnStartDateChanged(ChangeEventArgs e)
     {
         if (DateTime.TryParse(e.Value?.ToString(), out var date))
         {
             startDate = date;
         }
         selectedPreset = "custom";
-        StateHasChanged();
+        
+        // Auto-reload report if data is already loaded
+        if (isLoaded && !isLoading)
+        {
+            await LoadReport();
+        }
+        else
+        {
+            StateHasChanged();
+        }
     }
 
-    private void OnEndDateChanged(ChangeEventArgs e)
+    private async Task OnEndDateChanged(ChangeEventArgs e)
     {
         if (DateTime.TryParse(e.Value?.ToString(), out var date))
         {
             endDate = date;
         }
         selectedPreset = "custom";
-        StateHasChanged();
+        
+        // Auto-reload report if data is already loaded
+        if (isLoaded && !isLoading)
+        {
+            await LoadReport();
+        }
+        else
+        {
+            StateHasChanged();
+        }
     }
 
-    private void SetDatePreset(string preset)
+    private async Task OnGroupByChanged()
+    {
+        // Auto-reload report if data is already loaded
+        if (isLoaded && !isLoading)
+        {
+            await LoadReport();
+        }
+        else
+        {
+            StateHasChanged();
+        }
+    }
+
+    private async Task SetDatePreset(string preset)
     {
         selectedPreset = preset;
         var now = DateTime.Now;
@@ -454,7 +497,15 @@ else
                 break;
         }
         
-        StateHasChanged();
+        // Auto-reload report if data is already loaded
+        if (isLoaded && !isLoading)
+        {
+            await LoadReport();
+        }
+        else
+        {
+            StateHasChanged();
+        }
     }
 
     private void OnSearchInput(ChangeEventArgs e)

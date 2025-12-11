@@ -58,17 +58,8 @@ else
                     </div>
                 }
 
-                <!-- Date Filters -->
+                <!-- Filters -->
                 <div class="filter-section">
-                    <div class="filter-group">
-                        <label>Date Range</label>
-                        <div class="date-range-filters">
-                            <input type="date" class="form-control" value="@(startDate?.ToString("yyyy-MM-dd") ?? "")" @onchange="OnStartDateChange" />
-                            <span>to</span>
-                            <input type="date" class="form-control" value="@(endDate?.ToString("yyyy-MM-dd") ?? "")" @onchange="OnEndDateChange" />
-                        </div>
-                    </div>
-
                     <div class="filter-group">
                         <label>Category</label>
                         <div class="select-wrapper">
@@ -374,10 +365,6 @@ else
     private bool isLoaded = false;
     private bool isLoading = false;
     
-    // Date filters
-    private DateTime? startDate = null;
-    private DateTime? endDate = null;
-    
     // Search and Sort
     private string searchTerm = "";
     private string sortColumn = "ProductName";
@@ -445,9 +432,49 @@ else
 
         try
         {
-            await JSRuntime.InvokeVoidAsync("pdfExport.exportTableToPdf", 
-                "report-table", 
-                "Inventory Report",
+            // Generate report number
+            var reportNumber = $"INV-{DateTime.Now:yyyyMMdd}-{DateTime.Now:HHmmss}";
+            var generatedDate = DateTime.Now.ToString("dd.MM.yyyy");
+            
+            // Get filter information
+            var categoryFilter = selectedCategoryId > 0 
+                ? availableCategories.FirstOrDefault(c => c.category_id == selectedCategoryId)?.category_name ?? "All Categories"
+                : "All Categories";
+            var brandFilter = selectedBrandId > 0
+                ? availableBrands.FirstOrDefault(b => b.brand_id == selectedBrandId)?.brand_name ?? "All Brands"
+                : "All Brands";
+            
+            // Calculate summary metrics
+            var totalProducts = TotalProducts;
+            var totalQuantity = TotalQuantity;
+            var totalStockValue = TotalStockValue;
+            var lowStockItems = LowStockItems;
+            
+            // Convert all filtered report data to JSON for PDF export
+            var allReportData = FilteredReportData.Select(r => new
+            {
+                ProductName = r.ProductName,
+                SKU = r.SKU,
+                Category = r.Category,
+                Brand = r.Brand,
+                Quantity = r.Quantity,
+                CostPrice = r.CostPrice.ToString("N2"),
+                SellPrice = r.SellPrice.ToString("N2"),
+                StockValue = r.StockValue.ToString("N2"),
+                Status = r.Status
+            }).ToList();
+
+            await JSRuntime.InvokeVoidAsync("pdfExport.exportInventoryReportToPdf", 
+                "report-table",
+                reportNumber,
+                generatedDate,
+                categoryFilter,
+                brandFilter,
+                totalProducts,
+                totalQuantity,
+                totalStockValue,
+                lowStockItems,
+                System.Text.Json.JsonSerializer.Serialize(allReportData),
                 $"InventoryReport_{DateTime.Now:yyyyMMdd_HHmmss}.pdf");
         }
         catch (Exception ex)
@@ -576,38 +603,8 @@ else
         StateHasChanged();
     }
 
-    private void OnStartDateChange(ChangeEventArgs e)
-    {
-        if (DateTime.TryParse(e.Value?.ToString(), out var date))
-        {
-            startDate = date;
-        }
-        else
-        {
-            startDate = null;
-        }
-        currentPage = 1;
-        StateHasChanged();
-    }
-
-    private void OnEndDateChange(ChangeEventArgs e)
-    {
-        if (DateTime.TryParse(e.Value?.ToString(), out var date))
-        {
-            endDate = date;
-        }
-        else
-        {
-            endDate = null;
-        }
-        currentPage = 1;
-        StateHasChanged();
-    }
-
     private void ClearDateFilters()
     {
-        startDate = null;
-        endDate = null;
         selectedCategoryId = 0;
         selectedBrandId = 0;
         currentPage = 1;
@@ -616,7 +613,7 @@ else
 
     private bool HasActiveDateFilters()
     {
-        return startDate.HasValue || endDate.HasValue || selectedCategoryId > 0 || selectedBrandId > 0;
+        return selectedCategoryId > 0 || selectedBrandId > 0;
     }
 
     // Summary card calculations

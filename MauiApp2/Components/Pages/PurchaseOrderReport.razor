@@ -420,9 +420,49 @@ else
 
         try
         {
-            await JSRuntime.InvokeVoidAsync("pdfExport.exportTableToPdf", 
-                "report-table", 
-                "Purchase Order Report",
+            // Generate report number
+            var reportNumber = $"PO-{DateTime.Now:yyyyMMdd}-{DateTime.Now:HHmmss}";
+            var generatedDate = DateTime.Now.ToString("dd.MM.yyyy");
+            
+            // Get filter information
+            var startDateStr = startDate.HasValue ? startDate.Value.ToString("dd.MM.yyyy") : "All";
+            var endDateStr = endDate.HasValue ? endDate.Value.ToString("dd.MM.yyyy") : "All";
+            var supplierFilter = selectedSupplierId > 0 
+                ? availableSuppliers.FirstOrDefault(s => s.supplier_id == selectedSupplierId)?.supplier_name ?? "All Suppliers"
+                : "All Suppliers";
+            var statusFilter = string.IsNullOrEmpty(selectedStatus) ? "All Statuses" : selectedStatus;
+            
+            // Calculate summary metrics
+            var totalOrders = TotalOrders;
+            var totalItems = TotalItems;
+            var totalAmount = TotalAmount;
+            var pendingOrders = PendingOrders;
+            
+            // Convert all filtered report data to JSON for PDF export
+            var allReportData = FilteredReportData.Select(r => new
+            {
+                PurchaseOrderNumber = r.PurchaseOrderNumber,
+                OrderDate = r.OrderDate.ToString("MM/dd/yyyy"),
+                ExpectedDeliveryDate = r.ExpectedDeliveryDate.HasValue ? r.ExpectedDeliveryDate.Value.ToString("MM/dd/yyyy") : "N/A",
+                SupplierName = r.SupplierName,
+                Status = r.Status,
+                ItemCount = r.ItemCount,
+                TotalAmount = r.TotalAmount.ToString("N2")
+            }).ToList();
+            
+            await JSRuntime.InvokeVoidAsync("pdfExport.exportPurchaseOrderReportToPdf", 
+                "report-table",
+                reportNumber,
+                generatedDate,
+                startDateStr,
+                endDateStr,
+                supplierFilter,
+                statusFilter,
+                totalOrders,
+                totalItems,
+                totalAmount,
+                pendingOrders,
+                System.Text.Json.JsonSerializer.Serialize(allReportData),
                 $"PurchaseOrderReport_{DateTime.Now:yyyyMMdd_HHmmss}.pdf");
         }
         catch (Exception ex)
