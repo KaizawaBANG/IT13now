@@ -46,3 +46,4 @@ PRINT '';
 PRINT 'Note: Run this script on your cloud database too!';
 PRINT '';
 
+

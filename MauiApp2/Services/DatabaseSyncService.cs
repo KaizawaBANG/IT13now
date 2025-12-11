@@ -275,6 +275,10 @@ namespace MauiApp2.Services
                 // Get last sync timestamp for this table
                 var lastSyncTime = await GetLastSyncTimestampAsync(localConn, pcIdentifier, tableName, "Pull");
                 
+                // Check if local table is empty - if so, pull all data regardless of sync timestamp
+                var localRowCount = await GetTableRowCountAsync(localConn, tableName);
+                bool shouldPullAll = localRowCount == 0;
+                
                 // Get columns
                 var cloudColumns = await GetTableColumnsAsync(cloudConn, tableName);
                 var localColumns = await GetTableColumnsAsync(localConn, tableName);
@@ -317,20 +321,25 @@ namespace MauiApp2.Services
                 var pkColumn = await GetPrimaryKeyColumnAsync(cloudConn, tableName);
 
                 // Build query to get changed records from cloud
+                // If local table is empty, pull all data regardless of sync timestamp
                 var whereClause = "";
-                if (hasModifiedDate && lastSyncTime.HasValue)
+                if (!shouldPullAll)
                 {
-                    whereClause = "WHERE modified_date > @lastSyncTime OR modified_date IS NULL";
-                }
-                else if (lastSyncTime.HasValue)
-                {
-                    // If no modified_date, use created_date or just get all records
-                    var hasCreatedDate = columns.Any(c => string.Equals(c, "created_date", StringComparison.OrdinalIgnoreCase));
-                    if (hasCreatedDate)
+                    if (hasModifiedDate && lastSyncTime.HasValue)
                     {
-                        whereClause = "WHERE created_date > @lastSyncTime";
+                        whereClause = "WHERE modified_date > @lastSyncTime OR modified_date IS NULL";
+                    }
+                    else if (lastSyncTime.HasValue)
+                    {
+                        // If no modified_date, use created_date or just get all records
+                        var hasCreatedDate = columns.Any(c => string.Equals(c, "created_date", StringComparison.OrdinalIgnoreCase));
+                        if (hasCreatedDate)
+                        {
+                            whereClause = "WHERE created_date > @lastSyncTime";
+                        }
                     }
                 }
+                // If shouldPullAll is true, whereClause remains empty to pull all records
 
                 var selectQuery = $"SELECT * FROM [{tableName}] {whereClause}";
                 using var cloudCmd = new SqlCommand(selectQuery, cloudConn);
@@ -422,15 +431,32 @@ namespace MauiApp2.Services
                                     var setClause = string.Join(", ", updateColumns.Select(c => $"[{c}] = @{c}"));
                                     var updateQuery = $"UPDATE [{tableName}] SET {setClause} WHERE [{pkColumn}] = @pkValue";
                                     
-                                    using var updateCmd = new SqlCommand(updateQuery, localConn);
-                                    foreach (var column in updateColumns)
+                                    try
                                     {
-                                        var value = reader[column];
-                                        updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                        using var updateCmd = new SqlCommand(updateQuery, localConn);
+                                        foreach (var column in updateColumns)
+                                        {
+                                            var value = reader[column];
+                                            updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                        }
+                                        updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
+                                        var rowsAffected = await updateCmd.ExecuteNonQueryAsync();
+                                        if (rowsAffected > 0)
+                                        {
+                                            rowCount++;
+                                        }
+                                        else
+                                        {
+                                            errorCount++;
+                                            errors.Add($"{tableName} PK={pkValue}: UPDATE returned 0 rows affected");
+                                        }
                                     }
-                                    updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
-                                    await updateCmd.ExecuteNonQueryAsync();
-                                    rowCount++;
+                                    catch (SqlException sqlEx)
+                                    {
+                                        errorCount++;
+                                        errors.Add($"{tableName} PK={pkValue}: {sqlEx.Message}");
+                                        // Continue with next row
+                                    }
                                 }
                             }
                         }
@@ -444,7 +470,8 @@ namespace MauiApp2.Services
                             if (validationErrors.Any())
                             {
                                 errorCount++;
-                                errors.AddRange(validationErrors);
+                                var pkInfo = !string.IsNullOrEmpty(pkColumn) && pkValue != null ? $"PK={pkValue}" : "no PK";
+                                errors.Add($"{tableName} {pkInfo}: {string.Join("; ", validationErrors)}");
                                 continue; // Skip this row
                             }
                             
@@ -452,14 +479,33 @@ namespace MauiApp2.Services
                             var valueList = string.Join(", ", insertColumns.Select(c => $"@{c}"));
                             var insertQuery = $"INSERT INTO [{tableName}] ({columnList}) VALUES ({valueList})";
                             
-                            using var insertCmd = new SqlCommand(insertQuery, localConn);
-                            foreach (var column in insertColumns)
+                            try
                             {
-                                var value = reader[column];
-                                insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                using var insertCmd = new SqlCommand(insertQuery, localConn);
+                                foreach (var column in insertColumns)
+                                {
+                                    var value = reader[column];
+                                    insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                }
+                                var rowsAffected = await insertCmd.ExecuteNonQueryAsync();
+                                if (rowsAffected > 0)
+                                {
+                                    rowCount++;
+                                }
+                                else
+                                {
+                                    errorCount++;
+                                    var pkInfo = !string.IsNullOrEmpty(pkColumn) && pkValue != null ? $"PK={pkValue}" : "no PK";
+                                    errors.Add($"{tableName} {pkInfo}: INSERT returned 0 rows affected");
+                                }
                             }
-                            await insertCmd.ExecuteNonQueryAsync();
-                            rowCount++;
+                            catch (SqlException sqlEx)
+                            {
+                                errorCount++;
+                                var pkInfo = !string.IsNullOrEmpty(pkColumn) && pkValue != null ? $"PK={pkValue}" : "no PK";
+                                errors.Add($"{tableName} {pkInfo}: {sqlEx.Message}");
+                                // Continue with next row
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -496,11 +542,21 @@ namespace MauiApp2.Services
                     }
                 }
 
-                // Update sync timestamp
-                await UpdateSyncTimestampAsync(localConn, pcIdentifier, tableName, "Pull", rowCount);
+                // Only update sync timestamp if rows were actually saved
+                // This prevents marking sync as complete when no data was actually saved
+                if (rowCount > 0)
+                {
+                    await UpdateSyncTimestampAsync(localConn, pcIdentifier, tableName, "Pull", rowCount);
+                }
+                else if (errorCount > 0)
+                {
+                    // If there were errors but no rows saved, don't update timestamp
+                    // This allows retry on next sync
+                    result.ErrorMessage = $"No rows saved. {result.ErrorMessage}";
+                }
 
                 result.RowsCopied = rowCount;
-                result.IsSuccess = true;
+                result.IsSuccess = rowCount > 0 || errorCount == 0; // Success if rows saved OR no errors
             }
             catch (Exception ex)
             {
@@ -857,6 +913,21 @@ namespace MauiApp2.Services
             catch
             {
                 return null;
+            }
+        }
+
+        private async Task<int> GetTableRowCountAsync(SqlConnection connection, string tableName)
+        {
+            try
+            {
+                var query = $"SELECT COUNT(*) FROM [{tableName}]";
+                using var cmd = new SqlCommand(query, connection);
+                var result = await cmd.ExecuteScalarAsync();
+                return Convert.ToInt32(result);
+            }
+            catch
+            {
+                return 0;
             }
         }
         
