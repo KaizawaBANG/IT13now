@@ -278,12 +278,38 @@ namespace MauiApp2.Services
                 // Get columns
                 var cloudColumns = await GetTableColumnsAsync(cloudConn, tableName);
                 var localColumns = await GetTableColumnsAsync(localConn, tableName);
-                var columns = cloudColumns.Where(c => localColumns.Contains(c, StringComparer.OrdinalIgnoreCase)).ToList();
+                
+                // Get computed columns to exclude them from INSERT/UPDATE
+                var computedColumns = await GetComputedColumnsAsync(localConn, tableName);
+                
+                // Filter columns: must exist in both, and not be computed
+                var columns = cloudColumns
+                    .Where(c => localColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .Where(c => !computedColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
 
                 if (!columns.Any())
                 {
                     result.ErrorMessage = "No matching columns found";
                     return result;
+                }
+
+                // Check for identity column and ensure it's included when IDENTITY_INSERT will be used
+                var hasIdentity = await HasIdentityColumnAsync(localConn, tableName);
+                string? identityColumnName = null;
+                if (hasIdentity)
+                {
+                    identityColumnName = await GetIdentityColumnNameAsync(localConn, tableName);
+                    // Find matching identity column in cloud (case-insensitive)
+                    var cloudIdentityColumn = cloudColumns.FirstOrDefault(c => 
+                        string.Equals(c, identityColumnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    // If identity column exists in both but not in our list, add it
+                    if (!string.IsNullOrEmpty(cloudIdentityColumn) && 
+                        !columns.Any(c => string.Equals(c, cloudIdentityColumn, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        columns.Insert(0, cloudIdentityColumn);
+                    }
                 }
 
                 // Check if table has modified_date column
@@ -315,98 +341,159 @@ namespace MauiApp2.Services
 
                 using var reader = await cloudCmd.ExecuteReaderAsync();
                 int rowCount = 0;
+                int errorCount = 0;
+                var errors = new List<string>();
 
-                // Check for identity column
-                var hasIdentity = await HasIdentityColumnAsync(localConn, tableName);
-                string? identityColumnName = null;
-                if (hasIdentity)
-                {
-                    identityColumnName = await GetIdentityColumnNameAsync(localConn, tableName);
-                }
-
+                // Enable IDENTITY_INSERT if needed (must be done before any inserts)
                 if (hasIdentity && !string.IsNullOrEmpty(identityColumnName))
                 {
-                    var identityQuery = $"SET IDENTITY_INSERT [{tableName}] ON";
-                    using var identityCmd = new SqlCommand(identityQuery, localConn);
-                    await identityCmd.ExecuteNonQueryAsync();
+                    // Verify identity column is in our columns list
+                    var hasIdentityInList = columns.Any(c => 
+                        string.Equals(c, identityColumnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    if (hasIdentityInList)
+                    {
+                        var identityQuery = $"SET IDENTITY_INSERT [{tableName}] ON";
+                        using var identityCmd = new SqlCommand(identityQuery, localConn);
+                        await identityCmd.ExecuteNonQueryAsync();
+                    }
+                    else
+                    {
+                        // Identity column not in list, don't use IDENTITY_INSERT
+                        hasIdentity = false;
+                    }
                 }
 
                 while (await reader.ReadAsync())
                 {
-                    // Check if row exists in local
-                    bool rowExists = false;
-                    object? pkValue = null;
-                    
-                    if (!string.IsNullOrEmpty(pkColumn) && columns.Contains(pkColumn, StringComparer.OrdinalIgnoreCase))
+                    try
                     {
-                        pkValue = reader[pkColumn];
-                        var rowExistsQuery = $"SELECT COUNT(*) FROM [{tableName}] WHERE [{pkColumn}] = @pkValue";
-                        using var rowExistsCmd = new SqlCommand(rowExistsQuery, localConn);
-                        rowExistsCmd.Parameters.AddWithValue("@pkValue", pkValue);
-                        rowExists = (int)await rowExistsCmd.ExecuteScalarAsync() > 0;
-                    }
-
-                    if (rowExists && !string.IsNullOrEmpty(pkColumn) && pkValue != null)
-                    {
-                        // Update existing row (conflict resolution: cloud wins if it's newer)
-                        var updateColumns = columns.Where(c => !string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase)).ToList();
-                        if (updateColumns.Any())
+                        // Check if row exists in local
+                        bool rowExists = false;
+                        object? pkValue = null;
+                        
+                        if (!string.IsNullOrEmpty(pkColumn))
                         {
-                            // Check if cloud version is newer (if modified_date exists)
-                            bool shouldUpdate = true;
-                            if (hasModifiedDate)
+                            // Find matching cloud column name (case-insensitive)
+                            var cloudPkColumn = cloudColumns.FirstOrDefault(c => 
+                                string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase));
+                            
+                            if (!string.IsNullOrEmpty(cloudPkColumn) && 
+                                columns.Any(c => string.Equals(c, cloudPkColumn, StringComparison.OrdinalIgnoreCase)))
                             {
-                                var cloudModifiedDate = reader["modified_date"] as DateTime?;
-                                if (cloudModifiedDate.HasValue)
+                                pkValue = reader[cloudPkColumn];
+                                if (pkValue != null && pkValue != DBNull.Value)
                                 {
-                                    var localModifiedDate = await GetLocalModifiedDateAsync(localConn, tableName, pkColumn, pkValue);
-                                    if (localModifiedDate.HasValue && localModifiedDate.Value >= cloudModifiedDate.Value)
+                                    var rowExistsQuery = $"SELECT COUNT(*) FROM [{tableName}] WHERE [{pkColumn}] = @pkValue";
+                                    using var rowExistsCmd = new SqlCommand(rowExistsQuery, localConn);
+                                    rowExistsCmd.Parameters.AddWithValue("@pkValue", pkValue);
+                                    rowExists = (int)await rowExistsCmd.ExecuteScalarAsync() > 0;
+                                }
+                            }
+                        }
+
+                        if (rowExists && !string.IsNullOrEmpty(pkColumn) && pkValue != null)
+                        {
+                            // Update existing row (conflict resolution: cloud wins if it's newer)
+                            var updateColumns = columns
+                                .Where(c => !string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase))
+                                .Where(c => !computedColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                                .ToList();
+                            
+                            if (updateColumns.Any())
+                            {
+                                // Check if cloud version is newer (if modified_date exists)
+                                bool shouldUpdate = true;
+                                if (hasModifiedDate)
+                                {
+                                    var cloudModifiedDate = reader["modified_date"] as DateTime?;
+                                    if (cloudModifiedDate.HasValue)
                                     {
-                                        shouldUpdate = false; // Local is newer, don't overwrite
+                                        var localModifiedDate = await GetLocalModifiedDateAsync(localConn, tableName, pkColumn, pkValue);
+                                        if (localModifiedDate.HasValue && localModifiedDate.Value >= cloudModifiedDate.Value)
+                                        {
+                                            shouldUpdate = false; // Local is newer, don't overwrite
+                                        }
                                     }
                                 }
-                            }
 
-                            if (shouldUpdate)
-                            {
-                                var setClause = string.Join(", ", updateColumns.Select(c => $"[{c}] = @{c}"));
-                                var updateQuery = $"UPDATE [{tableName}] SET {setClause} WHERE [{pkColumn}] = @pkValue";
-                                
-                                using var updateCmd = new SqlCommand(updateQuery, localConn);
-                                foreach (var column in updateColumns)
+                                if (shouldUpdate)
                                 {
-                                    var value = reader[column];
-                                    updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                    var setClause = string.Join(", ", updateColumns.Select(c => $"[{c}] = @{c}"));
+                                    var updateQuery = $"UPDATE [{tableName}] SET {setClause} WHERE [{pkColumn}] = @pkValue";
+                                    
+                                    using var updateCmd = new SqlCommand(updateQuery, localConn);
+                                    foreach (var column in updateColumns)
+                                    {
+                                        var value = reader[column];
+                                        updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                    }
+                                    updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
+                                    await updateCmd.ExecuteNonQueryAsync();
+                                    rowCount++;
                                 }
-                                updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
-                                await updateCmd.ExecuteNonQueryAsync();
-                                rowCount++;
                             }
+                        }
+                        else
+                        {
+                            // Insert new row - validate data first
+                            var insertColumns = columns.ToList();
+                            
+                            // Validate required foreign keys and handle NULLs
+                            var validationErrors = await ValidateRowDataAsync(localConn, tableName, reader, insertColumns, cloudColumns);
+                            if (validationErrors.Any())
+                            {
+                                errorCount++;
+                                errors.AddRange(validationErrors);
+                                continue; // Skip this row
+                            }
+                            
+                            var columnList = string.Join(", ", insertColumns.Select(c => $"[{c}]"));
+                            var valueList = string.Join(", ", insertColumns.Select(c => $"@{c}"));
+                            var insertQuery = $"INSERT INTO [{tableName}] ({columnList}) VALUES ({valueList})";
+                            
+                            using var insertCmd = new SqlCommand(insertQuery, localConn);
+                            foreach (var column in insertColumns)
+                            {
+                                var value = reader[column];
+                                insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                            }
+                            await insertCmd.ExecuteNonQueryAsync();
+                            rowCount++;
                         }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        // Insert new row
-                        var columnList = string.Join(", ", columns.Select(c => $"[{c}]"));
-                        var valueList = string.Join(", ", columns.Select(c => $"@{c}"));
-                        var insertQuery = $"INSERT INTO [{tableName}] ({columnList}) VALUES ({valueList})";
-                        
-                        using var insertCmd = new SqlCommand(insertQuery, localConn);
-                        foreach (var column in columns)
-                        {
-                            var value = reader[column];
-                            insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
-                        }
-                        await insertCmd.ExecuteNonQueryAsync();
-                        rowCount++;
+                        errorCount++;
+                        errors.Add($"Row error: {ex.Message}");
+                        // Continue with next row instead of failing entire sync
+                        continue;
+                    }
+                }
+                
+                // Log errors if any
+                if (errorCount > 0)
+                {
+                    result.ErrorMessage = $"{errorCount} row(s) failed: {string.Join("; ", errors.Take(5))}";
+                    if (errors.Count > 5)
+                    {
+                        result.ErrorMessage += $" (and {errors.Count - 5} more)";
                     }
                 }
 
+                // Turn off IDENTITY_INSERT if it was enabled
                 if (hasIdentity && !string.IsNullOrEmpty(identityColumnName))
                 {
-                    var identityQuery = $"SET IDENTITY_INSERT [{tableName}] OFF";
-                    using var identityCmd = new SqlCommand(identityQuery, localConn);
-                    await identityCmd.ExecuteNonQueryAsync();
+                    try
+                    {
+                        var identityQuery = $"SET IDENTITY_INSERT [{tableName}] OFF";
+                        using var identityCmd = new SqlCommand(identityQuery, localConn);
+                        await identityCmd.ExecuteNonQueryAsync();
+                    }
+                    catch
+                    {
+                        // Ignore errors when turning off IDENTITY_INSERT
+                    }
                 }
 
                 // Update sync timestamp
@@ -460,12 +547,38 @@ namespace MauiApp2.Services
                 // Get columns
                 var localColumns = await GetTableColumnsAsync(localConn, tableName);
                 var cloudColumns = await GetTableColumnsAsync(cloudConn, tableName);
-                var columns = localColumns.Where(c => cloudColumns.Contains(c, StringComparer.OrdinalIgnoreCase)).ToList();
+                
+                // Get computed columns to exclude them from INSERT/UPDATE
+                var computedColumns = await GetComputedColumnsAsync(cloudConn, tableName);
+                
+                // Filter columns: must exist in both, and not be computed
+                var columns = localColumns
+                    .Where(c => cloudColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .Where(c => !computedColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
 
                 if (!columns.Any())
                 {
                     result.ErrorMessage = "No matching columns found";
                     return result;
+                }
+
+                // Check for identity column and ensure it's included when IDENTITY_INSERT will be used
+                var hasIdentity = await HasIdentityColumnAsync(cloudConn, tableName);
+                string? identityColumnName = null;
+                if (hasIdentity)
+                {
+                    identityColumnName = await GetIdentityColumnNameAsync(cloudConn, tableName);
+                    // Find matching identity column in local (case-insensitive)
+                    var localIdentityColumn = localColumns.FirstOrDefault(c => 
+                        string.Equals(c, identityColumnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    // If identity column exists in both but not in our list, add it
+                    if (!string.IsNullOrEmpty(localIdentityColumn) && 
+                        !columns.Any(c => string.Equals(c, localIdentityColumn, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        columns.Insert(0, localIdentityColumn);
+                    }
                 }
 
                 // Check if table has modified_date column
@@ -496,97 +609,158 @@ namespace MauiApp2.Services
 
                 using var reader = await localCmd.ExecuteReaderAsync();
                 int rowCount = 0;
+                int errorCount = 0;
+                var errors = new List<string>();
 
-                // Check for identity column
-                var hasIdentity = await HasIdentityColumnAsync(cloudConn, tableName);
-                string? identityColumnName = null;
-                if (hasIdentity)
-                {
-                    identityColumnName = await GetIdentityColumnNameAsync(cloudConn, tableName);
-                }
-
+                // Enable IDENTITY_INSERT if needed (must be done before any inserts)
                 if (hasIdentity && !string.IsNullOrEmpty(identityColumnName))
                 {
-                    var identityQuery = $"SET IDENTITY_INSERT [{tableName}] ON";
-                    using var identityCmd = new SqlCommand(identityQuery, cloudConn);
-                    await identityCmd.ExecuteNonQueryAsync();
+                    // Verify identity column is in our columns list
+                    var hasIdentityInList = columns.Any(c => 
+                        string.Equals(c, identityColumnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    if (hasIdentityInList)
+                    {
+                        var identityQuery = $"SET IDENTITY_INSERT [{tableName}] ON";
+                        using var identityCmd = new SqlCommand(identityQuery, cloudConn);
+                        await identityCmd.ExecuteNonQueryAsync();
+                    }
+                    else
+                    {
+                        // Identity column not in list, don't use IDENTITY_INSERT
+                        hasIdentity = false;
+                    }
                 }
 
                 while (await reader.ReadAsync())
                 {
-                    // Check if row exists in cloud
-                    bool rowExists = false;
-                    object? pkValue = null;
-                    
-                    if (!string.IsNullOrEmpty(pkColumn) && columns.Contains(pkColumn, StringComparer.OrdinalIgnoreCase))
+                    try
                     {
-                        pkValue = reader[pkColumn];
-                        var rowExistsQuery = $"SELECT COUNT(*) FROM [{tableName}] WHERE [{pkColumn}] = @pkValue";
-                        using var rowExistsCmd = new SqlCommand(rowExistsQuery, cloudConn);
-                        rowExistsCmd.Parameters.AddWithValue("@pkValue", pkValue);
-                        rowExists = (int)await rowExistsCmd.ExecuteScalarAsync() > 0;
-                    }
-
-                    if (rowExists && !string.IsNullOrEmpty(pkColumn) && pkValue != null)
-                    {
-                        // Update existing row (conflict resolution: local wins if it's newer)
-                        var updateColumns = columns.Where(c => !string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase)).ToList();
-                        if (updateColumns.Any())
+                        // Check if row exists in cloud
+                        bool rowExists = false;
+                        object? pkValue = null;
+                        
+                        if (!string.IsNullOrEmpty(pkColumn))
                         {
-                            bool shouldUpdate = true;
-                            if (hasModifiedDate)
+                            // Find matching local column name (case-insensitive)
+                            var localPkColumn = localColumns.FirstOrDefault(c => 
+                                string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase));
+                            
+                            if (!string.IsNullOrEmpty(localPkColumn) && 
+                                columns.Any(c => string.Equals(c, localPkColumn, StringComparison.OrdinalIgnoreCase)))
                             {
-                                var localModifiedDate = reader["modified_date"] as DateTime?;
-                                if (localModifiedDate.HasValue)
+                                pkValue = reader[localPkColumn];
+                                if (pkValue != null && pkValue != DBNull.Value)
                                 {
-                                    var cloudModifiedDate = await GetLocalModifiedDateAsync(cloudConn, tableName, pkColumn, pkValue);
-                                    if (cloudModifiedDate.HasValue && cloudModifiedDate.Value >= localModifiedDate.Value)
+                                    var rowExistsQuery = $"SELECT COUNT(*) FROM [{tableName}] WHERE [{pkColumn}] = @pkValue";
+                                    using var rowExistsCmd = new SqlCommand(rowExistsQuery, cloudConn);
+                                    rowExistsCmd.Parameters.AddWithValue("@pkValue", pkValue);
+                                    rowExists = (int)await rowExistsCmd.ExecuteScalarAsync() > 0;
+                                }
+                            }
+                        }
+
+                        if (rowExists && !string.IsNullOrEmpty(pkColumn) && pkValue != null)
+                        {
+                            // Update existing row (conflict resolution: local wins if it's newer)
+                            var updateColumns = columns
+                                .Where(c => !string.Equals(c, pkColumn, StringComparison.OrdinalIgnoreCase))
+                                .Where(c => !computedColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                                .ToList();
+                            
+                            if (updateColumns.Any())
+                            {
+                                bool shouldUpdate = true;
+                                if (hasModifiedDate)
+                                {
+                                    var localModifiedDate = reader["modified_date"] as DateTime?;
+                                    if (localModifiedDate.HasValue)
                                     {
-                                        shouldUpdate = false; // Cloud is newer, don't overwrite
+                                        var cloudModifiedDate = await GetLocalModifiedDateAsync(cloudConn, tableName, pkColumn, pkValue);
+                                        if (cloudModifiedDate.HasValue && cloudModifiedDate.Value >= localModifiedDate.Value)
+                                        {
+                                            shouldUpdate = false; // Cloud is newer, don't overwrite
+                                        }
                                     }
                                 }
-                            }
 
-                            if (shouldUpdate)
-                            {
-                                var setClause = string.Join(", ", updateColumns.Select(c => $"[{c}] = @{c}"));
-                                var updateQuery = $"UPDATE [{tableName}] SET {setClause} WHERE [{pkColumn}] = @pkValue";
-                                
-                                using var updateCmd = new SqlCommand(updateQuery, cloudConn);
-                                foreach (var column in updateColumns)
+                                if (shouldUpdate)
                                 {
-                                    var value = reader[column];
-                                    updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                    var setClause = string.Join(", ", updateColumns.Select(c => $"[{c}] = @{c}"));
+                                    var updateQuery = $"UPDATE [{tableName}] SET {setClause} WHERE [{pkColumn}] = @pkValue";
+                                    
+                                    using var updateCmd = new SqlCommand(updateQuery, cloudConn);
+                                    foreach (var column in updateColumns)
+                                    {
+                                        var value = reader[column];
+                                        updateCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                                    }
+                                    updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
+                                    await updateCmd.ExecuteNonQueryAsync();
+                                    rowCount++;
                                 }
-                                updateCmd.Parameters.AddWithValue("@pkValue", pkValue);
-                                await updateCmd.ExecuteNonQueryAsync();
-                                rowCount++;
                             }
+                        }
+                        else
+                        {
+                            // Insert new row - validate data first
+                            var insertColumns = columns.ToList();
+                            
+                            // Validate required foreign keys and handle NULLs
+                            var validationErrors = await ValidateRowDataAsync(cloudConn, tableName, reader, insertColumns, localColumns);
+                            if (validationErrors.Any())
+                            {
+                                errorCount++;
+                                errors.AddRange(validationErrors);
+                                continue; // Skip this row
+                            }
+                            
+                            var columnList = string.Join(", ", insertColumns.Select(c => $"[{c}]"));
+                            var valueList = string.Join(", ", insertColumns.Select(c => $"@{c}"));
+                            var insertQuery = $"INSERT INTO [{tableName}] ({columnList}) VALUES ({valueList})";
+                            
+                            using var insertCmd = new SqlCommand(insertQuery, cloudConn);
+                            foreach (var column in insertColumns)
+                            {
+                                var value = reader[column];
+                                insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
+                            }
+                            await insertCmd.ExecuteNonQueryAsync();
+                            rowCount++;
                         }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        // Insert new row
-                        var columnList = string.Join(", ", columns.Select(c => $"[{c}]"));
-                        var valueList = string.Join(", ", columns.Select(c => $"@{c}"));
-                        var insertQuery = $"INSERT INTO [{tableName}] ({columnList}) VALUES ({valueList})";
-                        
-                        using var insertCmd = new SqlCommand(insertQuery, cloudConn);
-                        foreach (var column in columns)
-                        {
-                            var value = reader[column];
-                            insertCmd.Parameters.AddWithValue($"@{column}", value == DBNull.Value ? DBNull.Value : value);
-                        }
-                        await insertCmd.ExecuteNonQueryAsync();
-                        rowCount++;
+                        errorCount++;
+                        errors.Add($"Row error: {ex.Message}");
+                        // Continue with next row instead of failing entire sync
+                        continue;
+                    }
+                }
+                
+                // Log errors if any
+                if (errorCount > 0)
+                {
+                    result.ErrorMessage = $"{errorCount} row(s) failed: {string.Join("; ", errors.Take(5))}";
+                    if (errors.Count > 5)
+                    {
+                        result.ErrorMessage += $" (and {errors.Count - 5} more)";
                     }
                 }
 
+                // Turn off IDENTITY_INSERT if it was enabled
                 if (hasIdentity && !string.IsNullOrEmpty(identityColumnName))
                 {
-                    var identityQuery = $"SET IDENTITY_INSERT [{tableName}] OFF";
-                    using var identityCmd = new SqlCommand(identityQuery, cloudConn);
-                    await identityCmd.ExecuteNonQueryAsync();
+                    try
+                    {
+                        var identityQuery = $"SET IDENTITY_INSERT [{tableName}] OFF";
+                        using var identityCmd = new SqlCommand(identityQuery, cloudConn);
+                        await identityCmd.ExecuteNonQueryAsync();
+                    }
+                    catch
+                    {
+                        // Ignore errors when turning off IDENTITY_INSERT
+                    }
                 }
 
                 // Update sync timestamp
@@ -1129,6 +1303,131 @@ namespace MauiApp2.Services
                 // Return empty list if table doesn't exist
             }
             return columns;
+        }
+
+        /// <summary>
+        /// Gets list of computed columns for a table (columns that cannot be inserted/updated)
+        /// </summary>
+        private async Task<List<string>> GetComputedColumnsAsync(SqlConnection connection, string tableName)
+        {
+            var computedColumns = new List<string>();
+            try
+            {
+                var query = @"
+                    SELECT c.name
+                    FROM sys.columns c
+                    INNER JOIN sys.tables t ON c.object_id = t.object_id
+                    WHERE t.name = @tableName
+                    AND c.is_computed = 1";
+
+                using var cmd = new SqlCommand(query, connection);
+                cmd.Parameters.AddWithValue("@tableName", tableName);
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    computedColumns.Add(reader.GetString(0));
+                }
+            }
+            catch
+            {
+                // Return empty list if table doesn't exist
+            }
+            return computedColumns;
+        }
+
+        /// <summary>
+        /// Validates row data before insertion to prevent constraint violations
+        /// </summary>
+        private async Task<List<string>> ValidateRowDataAsync(SqlConnection connection, string tableName, SqlDataReader reader, List<string> columns, List<string> sourceColumns)
+        {
+            var errors = new List<string>();
+            
+            try
+            {
+                // Get NOT NULL columns that don't have defaults
+                var query = @"
+                    SELECT c.name, c.is_nullable, c.default_object_id
+                    FROM sys.columns c
+                    INNER JOIN sys.tables t ON c.object_id = t.object_id
+                    WHERE t.name = @tableName
+                    AND c.is_computed = 0
+                    AND c.is_nullable = 0
+                    AND c.default_object_id = 0";
+                
+                using var cmd = new SqlCommand(query, connection);
+                cmd.Parameters.AddWithValue("@tableName", tableName);
+                using var nullableReader = await cmd.ExecuteReaderAsync();
+                
+                while (await nullableReader.ReadAsync())
+                {
+                    var columnName = nullableReader.GetString(0);
+                    // Find matching column in source (case-insensitive)
+                    var sourceColumn = sourceColumns.FirstOrDefault(c => 
+                        string.Equals(c, columnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    // Also check if it's in our columns list (might have different name)
+                    var targetColumn = columns.FirstOrDefault(c => 
+                        string.Equals(c, columnName, StringComparison.OrdinalIgnoreCase));
+                    
+                    if (!string.IsNullOrEmpty(targetColumn) && columns.Contains(targetColumn, StringComparer.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            // Try to read from reader using source column name or target column name
+                            object? value = null;
+                            if (!string.IsNullOrEmpty(sourceColumn))
+                            {
+                                try { value = reader[sourceColumn]; } catch { }
+                            }
+                            if (value == null && !string.IsNullOrEmpty(targetColumn))
+                            {
+                                try { value = reader[targetColumn]; } catch { }
+                            }
+                            
+                            if (value == null || value == DBNull.Value)
+                            {
+                                errors.Add($"Column '{columnName}' cannot be NULL");
+                            }
+                        }
+                        catch
+                        {
+                            // Column doesn't exist in reader, skip
+                        }
+                    }
+                }
+                
+                // Special validation for known CHECK constraints
+                if (tableName.Equals("tbl_stock_in_items", StringComparison.OrdinalIgnoreCase))
+                {
+                    var quantityReceivedCol = sourceColumns.FirstOrDefault(c => 
+                        string.Equals(c, "quantity_received", StringComparison.OrdinalIgnoreCase));
+                    if (!string.IsNullOrEmpty(quantityReceivedCol))
+                    {
+                        try
+                        {
+                            var quantityReceived = reader[quantityReceivedCol];
+                            if (quantityReceived != null && quantityReceived != DBNull.Value)
+                            {
+                                var qty = Convert.ToInt32(quantityReceived);
+                                if (qty < 0)
+                                {
+                                    errors.Add("quantity_received must be >= 0");
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Skip if column doesn't exist or can't convert
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // If validation query fails, continue without validation
+            }
+            
+            return errors;
         }
     }
 
